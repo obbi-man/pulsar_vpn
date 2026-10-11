@@ -1,0 +1,258 @@
+# Build Pulsar VPN installers / packages for Android, Windows, macOS (+ iOS notes).
+name: Build Pulsar apps
+
+on:
+  push:
+    branches: [main, master, "cursor/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-apps-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin known-good stable; override via workflow_dispatch inputs later if needed.
+  FLUTTER_VERSION: "3.35.7"
+  PULSAR_API_BASE: "https://api.example.com"
+
+jobs:
+  # -------------------------------------------------------------------------
+  android-apk:
+    name: android-apk
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Build AAB (Play Store)
+        run: flutter build appbundle --release --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Stage dist/android
+        run: |
+          chmod +x tool/package_android.sh
+          ./tool/package_android.sh
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-android-apk
+          path: |
+            dist/android/PulsarVPN.apk
+            dist/android/PulsarVPN.aab
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  windows-installer:
+    name: windows-installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: flutter
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      # One line — avoid PowerShell backtick continuation issues in YAML.
+      - name: Build Windows release
+        run: flutter build windows --release --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Zip portable build
+        run: |
+          New-Item -ItemType Directory -Force -Path ../dist/windows | Out-Null
+          $rel = "build/windows/x64/runner/Release"
+          if (-not (Test-Path $rel)) { $rel = "build/windows/runner/Release" }
+          Compress-Archive -Path "$rel/*" -DestinationPath ../dist/windows/PulsarVPN-windows.zip -Force
+          Get-ChildItem $rel | Select-Object Name,Length
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        run: |
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after choco install innosetup" }
+          & $iscc installer\windows\pulsar.iss
+          if (-not (Test-Path ..\dist\windows\PulsarVPN-Setup.exe)) {
+            throw "PulsarVPN-Setup.exe was not produced"
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-windows-installer
+          path: |
+            dist/windows/PulsarVPN-Setup.exe
+            dist/windows/PulsarVPN-windows.zip
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  macos-dmg:
+    name: macos-dmg
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      # NE entitlements require an Apple team; strip for unsigned CI builds.
+      - name: Strip NE entitlements for CI
+        run: |
+          chmod +x tool/ci_strip_ne_entitlements.sh
+          ./tool/ci_strip_ne_entitlements.sh
+
+      - name: CocoaPods
+        run: |
+          gem install cocoapods --no-document || true
+          cd macos
+          pod install --repo-update || pod install
+
+      - name: Build macOS release (unsigned)
+        env:
+          CODE_SIGN_IDENTITY: "-"
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGNING_ALLOWED: "NO"
+        run: flutter build macos --release --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Package DMG
+        run: |
+          chmod +x tool/package_macos.sh
+          ./tool/package_macos.sh
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-macos-dmg
+          path: dist/macos/PulsarVPN.dmg
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Always produces signing notes. iOS compile is best-effort (no Apple team).
+  ios-notes:
+    name: ios-notes
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Strip NE entitlements for CI
+        run: |
+          chmod +x tool/ci_strip_ne_entitlements.sh
+          ./tool/ci_strip_ne_entitlements.sh
+
+      - name: CocoaPods
+        run: |
+          gem install cocoapods --no-document || true
+          cd ios
+          pod install --repo-update || pod install || true
+
+      - name: Build iOS (no codesign, best-effort)
+        id: ios_build
+        continue-on-error: true
+        run: flutter build ios --release --no-codesign --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Write signing notes
+        if: always()
+        run: |
+          mkdir -p ../dist/ios
+          BUILD_OK="${{ steps.ios_build.outcome }}"
+          cat > ../dist/ios/README-SIGNING.md <<EOF
+          # Pulsar VPN — iOS install
+
+          CI outcome for \`flutter build ios --no-codesign\`: **${BUILD_OK}**
+
+          Unsigned CI builds strip Network Extension entitlements so the job can
+          finish without an Apple Developer team. For a real VPN on device you must
+          restore NE entitlements and sign with your team.
+
+          ## What you need
+          1. Apple Developer Program membership
+          2. Distribution certificate + provisioning profile
+          3. Xcode → \`ios/Runner.xcworkspace\` → Team → Archive
+          4. Or: \`flutter build ipa\` after configuring signing
+
+          ## Network Extension
+          See \`ios/XCODE_PACKET_TUNNEL.md\`. Packet Tunnel requires paid program.
+
+          ## TestFlight / App Store
+          Upload signed IPA via Xcode Organizer / Transporter.
+          EOF
+          find build/ios -name 'Runner.app' 2>/dev/null | head -5 > ../dist/ios/build-paths.txt || true
+          echo "notes_written" > ../dist/ios/ci-status.txt
+          echo "ios_build=${BUILD_OK}" >> ../dist/ios/ci-status.txt
+
+      - name: Upload iOS notes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-ios-notes
+          path: dist/ios/
+          if-no-files-found: error
