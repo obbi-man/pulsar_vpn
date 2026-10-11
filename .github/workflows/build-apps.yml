@@ -1,0 +1,219 @@
+# Build Pulsar VPN installers / packages for Android, Windows, macOS (+ iOS notes).
+name: Build Pulsar apps
+
+on:
+  push:
+    branches: [main, master, "cursor/**"]
+    tags: ["v*"]
+    paths:
+      - "flutter/**"
+      - ".github/workflows/build-apps.yml"
+  pull_request:
+    paths:
+      - "flutter/**"
+      - ".github/workflows/build-apps.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: build-apps-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.35.7"
+  PULSAR_API_BASE: "https://api.example.com"
+
+jobs:
+  # -------------------------------------------------------------------------
+  android-apk:
+    name: android-apk
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release \
+            --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Build AAB (Play Store)
+        run: |
+          flutter build appbundle --release \
+            --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Stage dist/android
+        run: |
+          chmod +x tool/package_android.sh
+          ./tool/package_android.sh
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-android-apk
+          path: |
+            dist/android/PulsarVPN.apk
+            dist/android/PulsarVPN.aab
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  windows-installer:
+    name: windows-installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Build Windows release
+        run: |
+          flutter build windows --release `
+            --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Zip portable build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ../dist/windows | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* `
+            -DestinationPath ../dist/windows/PulsarVPN-windows.zip -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows\pulsar.iss
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-windows-installer
+          path: |
+            dist/windows/PulsarVPN-Setup.exe
+            dist/windows/PulsarVPN-windows.zip
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  macos-dmg:
+    name: macos-dmg
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Build macOS release
+        run: |
+          flutter build macos --release \
+            --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Package DMG
+        run: |
+          chmod +x tool/package_macos.sh
+          ./tool/package_macos.sh
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-macos-dmg
+          path: dist/macos/PulsarVPN.dmg
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  ios-notes:
+    name: ios-notes
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: flutter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        run: |
+          flutter build ios --release --no-codesign \
+            --dart-define=PULSAR_API_BASE=${{ env.PULSAR_API_BASE }}
+
+      - name: Write signing notes + archive tip
+        run: |
+          mkdir -p ../dist/ios
+          cat > ../dist/ios/README-SIGNING.md <<'EOF'
+          # Pulsar VPN — iOS install
+
+          CI builds an **unsigned** iOS release (`flutter build ios --no-codesign`).
+          You cannot install it on a device until you sign it.
+
+          ## What you need
+          1. Apple Developer Program membership
+          2. Distribution certificate + App Store / Ad Hoc provisioning profile
+          3. Xcode → open `ios/Runner.xcworkspace` → select Team → Archive
+          4. Or: `flutter build ipa` with export options after configuring signing in Xcode
+
+          ## Network Extension
+          Packet Tunnel entitlement requires a paid Apple Developer account and
+          correct App Group / NE entitlements (see `ios/XCODE_PACKET_TUNNEL.md`).
+
+          ## TestFlight / App Store
+          Upload the signed IPA via Xcode Organizer or `xcrun altool` / Transporter.
+          EOF
+          # Keep Runner.app path reference for local packaging
+          find build/ios -name 'Runner.app' | head -5 > ../dist/ios/build-paths.txt || true
+
+      - name: Upload iOS notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsar-ios-notes
+          path: dist/ios/
+          if-no-files-found: error

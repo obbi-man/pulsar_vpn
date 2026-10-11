@@ -1,0 +1,261 @@
+# Cloud-only FFI builds for CustomShield (custom-protocol/client.go via build-libs.sh).
+# No local compilers required — download artifacts / customshield-libs.zip into Flutter.
+name: Build CustomShield libs
+
+on:
+  push:
+    branches: [main, master, "cursor/**"]
+    tags: ["v*"]
+    paths:
+      - "custom-protocol/**"
+      - ".github/workflows/build-libs.yml"
+  pull_request:
+    paths:
+      - "custom-protocol/**"
+      - ".github/workflows/build-libs.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: build-libs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.22.x"
+  ANDROID_API: "24"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Android .so — arm64-v8a, armeabi-v7a, x86_64
+  # ---------------------------------------------------------------------------
+  build-android:
+    name: build-android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: custom-protocol/go.sum
+
+      # Equivalent of niddzu/action-setup-android-ndk — well-maintained NDK installer.
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          link-to-sdk: false
+
+      - name: Build Android CGO shared libraries
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_API: ${{ env.ANDROID_API }}
+          CS_TARGETS: android
+          CS_STRICT: "1"
+        run: |
+          set -euo pipefail
+          chmod +x custom-protocol/build-libs.sh
+          ./custom-protocol/build-libs.sh "${{ github.workspace }}/dist/libs"
+          test -f dist/libs/android/arm64-v8a/libcustomshield.so
+          test -f dist/libs/android/armeabi-v7a/libcustomshield.so
+          test -f dist/libs/android/x86_64/libcustomshield.so
+          find dist/libs/android -type f | sort
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customshield-android
+          path: |
+            dist/libs/android/
+            dist/libs/include/
+            dist/libs/FLUTTER_DROP_IN.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 2) Windows .dll (mingw cross-compile on Ubuntu)
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: custom-protocol/go.sum
+
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Build Windows c-shared DLL
+        env:
+          CS_TARGETS: windows
+          CS_STRICT: "1"
+          CC_WINDOWS: x86_64-w64-mingw32-gcc
+        run: |
+          set -euo pipefail
+          chmod +x custom-protocol/build-libs.sh
+          ./custom-protocol/build-libs.sh "${{ github.workspace }}/dist/libs"
+          test -f dist/libs/windows/amd64/customshield.dll
+          file dist/libs/windows/amd64/customshield.dll
+          find dist/libs/windows -type f | sort
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customshield-windows
+          path: |
+            dist/libs/windows/
+            dist/libs/include/
+            dist/libs/FLUTTER_DROP_IN.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3) Apple — iOS .a / .xcframework + macOS .dylib
+  # ---------------------------------------------------------------------------
+  build-apple:
+    name: build-apple
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: custom-protocol/go.sum
+
+      - name: Xcode / CLT
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Build iOS archives/xcframework + macOS dylibs
+        env:
+          CS_TARGETS: darwin,ios
+          CS_STRICT: "1"
+        run: |
+          set -euo pipefail
+          chmod +x custom-protocol/build-libs.sh
+          ./custom-protocol/build-libs.sh "${{ github.workspace }}/dist/libs"
+          test -f dist/libs/darwin/arm64/libcustomshield.dylib
+          test -f dist/libs/darwin/amd64/libcustomshield.dylib
+          test -f dist/libs/ios/device/libcustomshield.a
+          test -d dist/libs/ios/CustomShield.xcframework
+          find dist/libs/darwin dist/libs/ios -type f | sort
+
+      - name: Upload Apple artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customshield-apple
+          path: |
+            dist/libs/darwin/
+            dist/libs/ios/
+            dist/libs/include/
+            dist/libs/FLUTTER_DROP_IN.md
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Merge → customshield-libs.zip (Flutter drop-in bundle)
+  # ---------------------------------------------------------------------------
+  merge-libs:
+    name: merge-libs
+    needs: [build-android, build-windows, build-apple]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: customshield-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Assemble dist/libs tree + ZIP
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zip
+          mkdir -p dist/libs
+
+          # Each artifact downloads into artifacts/<artifact-name>/
+          for name in customshield-android customshield-windows customshield-apple; do
+            src="artifacts/${name}"
+            if [[ -d "$src" ]]; then
+              cp -a "$src"/. dist/libs/
+            fi
+          done
+
+          # Stable drop-in doc
+          cat > dist/libs/FLUTTER_DROP_IN.md <<'EOF'
+          # CustomShield libs — Flutter drop-in
+
+          ## Android → jniLibs
+          ```
+          android/arm64-v8a/libcustomshield.so  → flutter/android/app/src/main/jniLibs/arm64-v8a/
+          android/armeabi-v7a/libcustomshield.so → flutter/android/app/src/main/jniLibs/armeabi-v7a/
+          android/x86_64/libcustomshield.so     → flutter/android/app/src/main/jniLibs/x86_64/
+          ```
+
+          ## iOS Network Extension
+          ```
+          ios/CustomShield.xcframework/   → link into PacketTunnel / ios/Extensions
+          ios/device/libcustomshield.a    → alternative static link
+          ```
+
+          ## macOS
+          ```
+          darwin/arm64/libcustomshield.dylib → Flutter macOS Runner / Frameworks
+          darwin/amd64/libcustomshield.dylib
+          ```
+
+          ## Windows
+          ```
+          windows/amd64/customshield.dll → flutter/windows/runner/ (or build output dir)
+          ```
+          EOF
+
+          # Fix accidental leading spaces from heredoc indentation
+          sed -i 's/^          //' dist/libs/FLUTTER_DROP_IN.md
+
+          echo "=== tree ==="
+          find dist/libs -type f | sort
+
+          (cd dist/libs && zip -r ../customshield-libs.zip .)
+          ls -lh dist/customshield-libs.zip
+
+      - name: Upload merged folder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customshield-libs
+          path: dist/libs/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: customshield-libs-zip
+          path: dist/customshield-libs.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach ZIP to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/customshield-libs.zip
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
